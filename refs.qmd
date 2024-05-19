@@ -1,0 +1,349 @@
+---
+title: "Are refs biased for the home team?"
+author: "Zev Burton"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    fig_caption: true
+eval: false
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Data collection
+
+```{r}
+# game / fouls info
+library(nbastatR)
+library(tidyverse)
+library(ggthemes)
+library(lme4)
+library(ggdist)
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(lubridate::year)
+conflicted::conflicts_prefer(lubridate::month)
+
+raw_data <- game_logs(seasons = 2024,
+                      result_types = 'team')
+
+data <- raw_data %>% 
+  select(dateGame, 
+         idGame,
+         nameTeam, 
+         locationGame,
+         slugTeam,
+         slugOpponent,
+         slugTeamWinner,
+         slugTeamLoser,
+         minutesTeam,
+         pfTeam
+         )
+
+# Split the data into home and away datasets
+home_data <- data %>%
+  filter(locationGame == "H") %>%
+  select(idGame, dateGame, home_team = slugTeam, opponent_team = slugOpponent, winner = slugTeamWinner, home_fouls = pfTeam)
+
+away_data <- data %>%
+  filter(locationGame == "A") %>%
+  select(idGame, away_fouls = pfTeam)
+
+# Merge the home and away datasets on idGame
+final_dataframe <- merge(home_data, away_data, by = "idGame")
+
+# Rename columns and add location
+final_dataframe <- final_dataframe %>%
+  mutate(location = ifelse(winner == home_team, "Home", "Away"))
+
+# Select and rearrange the columns as needed
+final_dataframe <- final_dataframe %>%
+  select(id = idGame, date = dateGame, location, home_team, opponent_team, winner, home_fouls, away_fouls)
+
+# crowd data
+library(rvest)
+library(lubridate)
+
+get_monthly_data <- function(year, month) {
+  url <- paste0("https://www.basketball-reference.com/leagues/NBA_", year, "_games-", month, ".html")
+  webpage <- read_html(url)
+  
+  col_names <- webpage %>% 
+    html_nodes("table#schedule > thead > tr > th") %>% 
+    html_attr("data-stat")    
+  col_names <- c("game_id", col_names)
+  
+  dates <- webpage %>% 
+    html_nodes("table#schedule > tbody > tr > th") %>% 
+    html_text()
+  dates <- dates[dates != "Playoffs"]
+  
+  game_id <- webpage %>% 
+    html_nodes("table#schedule > tbody > tr > th") %>%
+    html_attr("csk")
+  game_id <- game_id[!is.na(game_id)]
+  
+  data <- webpage %>% 
+    html_nodes("table#schedule > tbody > tr > td") %>% 
+    html_text() %>%
+    matrix(ncol = length(col_names) - 2, byrow = TRUE)
+  
+  month_df <- as.data.frame(cbind(game_id, dates, data), stringsAsFactors = FALSE)
+  names(month_df) <- col_names
+  
+  return(month_df)
+}
+
+# Months of the season
+months <- c("october", "november", "december", "january", "february", "march", "april")
+
+# Scrape the data for the year 2024
+data_list <- lapply(months, get_monthly_data, year = "2024")
+
+# Combine the data into one dataframe
+all_data <- do.call(rbind, data_list)
+
+all_data$date_game <- as.Date(all_data$date_game, format="%a, %b %d, %Y")
+final_dataframe$date <- as.Date(final_dataframe$date)
+
+final_dataframe$game_id <- paste(
+  year(final_dataframe$date), 
+  sprintf("%02d", month(final_dataframe$date)), 
+  sprintf("%02d", day(final_dataframe$date)), 
+  '0',
+  final_dataframe$home_team, 
+  sep = ""
+)
+
+data <- merge(final_dataframe, all_data, by = "game_id") %>%
+  select(date, home_team, opponent_team, winner, home_fouls, away_fouls, overtimes, attendance)
+
+data$attendance <- as.numeric(gsub(",", "", data$attendance))
+
+# quick check to make sure we don't include playoffs
+tail(data) # we're good
+
+# Adjusting for overtime fouls - fouls per 48 minutes 
+
+# OT is 5 minutes, so we will multiply home_fouls and away_fouls by 48/53 for the 47 OT games
+# For 2OT, we will multiply home_fouls and away_fouls by 48/58 for the 8 2OT games
+# Note: this adjustment changes the analysis from a Poisson (count) distribution to a continuous one.
+
+data$home_fouls_adj <- case_when(
+  data$overtimes == 'OT' ~ data$home_fouls * 48 / 53,
+  data$overtimes == '2OT' ~ data$home_fouls * 48 / 58,
+  TRUE ~ data$home_fouls 
+)
+
+data$away_fouls_adj <- case_when(
+  data$overtimes == 'OT' ~ data$away_fouls * 48 / 53,
+  data$overtimes == '2OT' ~ data$away_fouls * 48 / 58,
+  TRUE ~ data$away_fouls 
+)
+```
+
+```{r}
+# and a theme
+theme_nba <- function() {
+    theme_minimal(base_size = 15) +
+        theme(
+            text = element_text(family = "Arial", color = "#333333"),
+            plot.background = element_rect(fill = "#F7F7F7", color = NA),
+            panel.background = element_rect(fill = "#F7F7F7", color = NA),
+            panel.grid.major = element_line(color = "#DDDDDD", size = 0.5),
+            panel.grid.minor = element_line(color = "#EEEEEE", size = 0.2),
+            axis.title = element_text(color = "#333333", size = 14),
+            axis.text = element_text(color = "#333333", size = 12),
+            axis.line = element_line(color = "#333333"),
+            axis.ticks = element_line(color = "#333333"),
+            legend.background = element_rect(fill = "#F7F7F7", color = NA),
+            legend.key = element_rect(fill = "#F7F7F7", color = NA),
+            legend.text = element_text(color = "#333333", size = 12),
+            legend.title = element_text(color = "#333333", size = 14, face = "bold"),
+            plot.title = element_text(face = "bold", size = 20, color = "#1D428A"),
+            plot.subtitle = element_text(size = 16, color = "#555555"),
+            plot.caption = element_text(size = 10, color = "#777777", hjust = 0)
+        )
+}
+
+nba_pal <- c("darkblue", "firebrick", "darkorchid4", "steelblue")
+```
+
+# Are refs biased for the home team?
+
+```{r}
+# Basic means test 
+home_means <- data %>%
+    summarise(Mean = mean(home_fouls_adj),
+              Lower_CI = Mean - qt(0.975, df = n()-1) * sd(home_fouls_adj) / sqrt(n()),
+              Upper_CI = Mean + qt(0.975, df = n()-1) * sd(home_fouls_adj) / sqrt(n()))
+
+away_means <- data %>%
+    summarise(Mean = mean(away_fouls_adj),
+              Lower_CI = Mean - qt(0.975, df = n()-1) * sd(away_fouls_adj) / sqrt(n()),
+              Upper_CI = Mean + qt(0.975, df = n()-1) * sd(away_fouls_adj) / sqrt(n()))
+
+# Print the results
+print(home_means)
+print(away_means)
+```
+
+```{r}
+# Checking for normality
+
+# Calculate differences in fouls between home and away teams
+foul_differences <- data$home_fouls_adj - data$away_fouls_adj
+
+# Perform Shapiro-Wilk test for normality on the differences
+shapiro_test <- shapiro.test(foul_differences)
+
+# Perform visual inspection with a Q-Q plot
+qqnorm(foul_differences)
+qqline(foul_differences, col = nba_pal[4])
+
+# Print the results of the Shapiro-Wilk test
+print(shapiro_test)
+```
+
+The results from the Shapiro-Wilk normality test indicate that the
+p-value is 0.004677, which is less than the common significance level of 0.05. This suggests that you should reject the null hypothesis that the distribution of the differences in fouls between home and away teams is normal.
+
+Given this result, it would be more appropriate to use a non-parametric test to compare the fouls between home and away teams, since non-parametric tests do not assume a normal distribution. The Wilcoxon signed-rank test, which is the non-parametric counterpart to the paired t-test, can be used in this case.
+
+```{r}
+# Perform the Wilcoxon signed-rank test
+wilcoxon_test <- wilcox.test(data$home_fouls_adj, data$away_fouls_adj, paired = TRUE)
+
+# Print the results of the Wilcoxon test
+print(wilcoxon_test)
+```
+
+```{r}
+data_fouls <- data %>%
+  select(home_fouls_adj, away_fouls_adj) %>%
+  pivot_longer(cols = c(home_fouls_adj, away_fouls_adj), names_to = "Team", values_to = "Fouls")
+
+# Assuming data_fouls is your dataframe and nba_pal contains color values for home and away teams
+ggplot(data_fouls, aes(x = Team, y = Fouls, fill = Team)) +
+  geom_violin(trim = TRUE, alpha = 0.5, width = 0.8, scale = "width") +  # Adjust trim and alpha
+  geom_boxplot(width = 0.1, outlier.shape = NA, position = position_dodge(width = 0.75)) +  # Adjust dodge width
+  labs(title = "Comparison of Adjusted Home and Away Fouls", 
+       y = "Number of Fouls") +
+  scale_x_discrete(labels = c("away_fouls_adj" = "Away Team",
+                              "home_fouls_adj" = "Home Team")) +
+  theme_nba() + 
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 12)) +  
+  scale_fill_manual(values = c("home_fouls_adj" = nba_pal[1],
+                               "away_fouls_adj" = nba_pal[2]))
+```
+
+There does not appear to be a bias for home teams (at least at this point), but we should control for the attendance, since that's supposed to be what matters!
+
+# Impact of attendance on home fouls
+
+```{r}
+library(ggpubr)
+summary(lm(home_fouls_adj ~ attendance, data = data))
+
+ggplot(data, aes(x = attendance, y = home_fouls_adj)) +
+  geom_point(color = nba_pal[1], alpha = .1) +
+  geom_smooth(method = "lm", color = nba_pal[1]) +
+  labs(title = "Relationship between Attendance and Home Fouls",
+       x = "Attendance",
+       y = "Home Fouls (per 48 minutes)") +
+  theme_nba()+
+  stat_cor(method = "pearson", label.x = 13000, label.y = 39, p.accuracy = 0.001, r.accuracy = 0.01, color = nba_pal[1]) +
+  scale_x_continuous(labels = comma_format())
+
+```
+
+Weak Negative Relationship: There is a weak negative relationship between attendance and home fouls. As attendance increases, the number of home fouls slightly decreases. However, the effect is minimal.
+
+The low R-squared value indicates that attendance is not a strong predictor of home fouls. There are likely other factors influencing home fouls that are not accounted for in this simple linear model. These factors could include team strategy, referee behavior, game context, player behavior, and more.
+
+While the relationship is statistically significant, the practical impact of attendance on home fouls is negligible due to the small slope and low R-squared value. For practical decision-making, it would be necessary to consider additional variables and potentially more complex models.
+
+# On away fouls
+
+```{r}
+summary(lm(away_fouls_adj ~ attendance, data = data))
+
+ggplot(data, aes(x = attendance, y = away_fouls_adj)) +
+  geom_point(color = nba_pal[2], alpha = .1) +
+  geom_smooth(method = "lm", color = nba_pal[2]) +
+  labs(title = "Relationship between Attendance and Away Fouls",
+       x = "Attendance",
+       y = "Away Fouls (per 48 minutes)") +
+  theme_nba()+
+  theme(plot.title = element_text(color = nba_pal[2]))+
+  stat_cor(method = "pearson", label.x = 13000, label.y = 34, p.accuracy = 0.001, r.accuracy = 0.01, color = nba_pal[2])+
+  scale_x_continuous(labels = comma_format())
+
+```
+
+The analysis demonstrates, like home fouls, that attendance does not significantly influence away fouls. Both the statistical tests and visual representation confirm that the correlation is weak and statistically insignificant. This suggests that other factors, not included in this model, play a more critical role in determining away fouls during games. To gain better insights, further analysis incorporating different variables and possibly more complex models would be necessary.
+
+# Total fouls
+
+```{r}
+data <- data %>%
+  mutate(total_fouls_adj = home_fouls_adj + away_fouls_adj)
+
+summary(lm(total_fouls_adj ~ attendance, data = data))
+
+ggplot(data, aes(x = attendance, y = total_fouls_adj)) +
+  geom_point(color = nba_pal[3], alpha = .1) +
+  geom_smooth(method = "lm", color = nba_pal[3]) +
+  labs(title = "Relationship between Attendance and Total Fouls",
+       x = "Attendance",
+       y = "Total Fouls (per 48 minutes)")+
+  theme_nba()+
+  theme(plot.title = element_text(color = nba_pal[3]))+
+  stat_cor(method = "pearson", label.x = 13000, label.y = 58, p.accuracy = 0.001, r.accuracy = 0.01, color = nba_pal[3])+
+  scale_x_continuous(labels = comma_format())
+
+```
+
+Once again, not much. Perhaps there is a slight decrease in fouls, but it's certainly not large enough to dig any deeper.
+
+# plot of away vs. home fouls
+
+```{r}
+# Calculate the average home fouls for each team
+library(nbaplotR)
+avg_home_fouls <- data %>%
+  group_by(home_team) %>%
+  summarise(avg_home_fouls = mean(home_fouls_adj, na.rm = TRUE)) %>%
+  rename(team = home_team)
+
+# Calculate the average away fouls for each team
+avg_away_fouls <- data %>%
+  group_by(opponent_team) %>%
+  summarise(avg_away_fouls = mean(away_fouls_adj, na.rm = TRUE)) %>%
+  rename(team = opponent_team)
+
+# Combine the results
+avg_fouls <- inner_join(avg_home_fouls, avg_away_fouls, by = "team")
+
+# Create the scatter plot
+ggplot(avg_fouls, aes(x = avg_home_fouls, y = avg_away_fouls, label = team)) +
+  annotate("segment", x= 15, y = 15, xend = 22, yend=22, color = nba_pal[4]) +
+  nbaplotR::geom_nba_logos(aes(team_abbr = team), height = .05)+
+  labs(title = "Average Home Fouls vs. Average Away Fouls by Team",
+       x = "Average Home Fouls",
+       y = "Average Away Fouls") +
+  xlim(15, 22) +
+  ylim(15, 22) +
+  theme_nba()
+```
+
+You know, maybe my Pacers do foul a fair bit.
